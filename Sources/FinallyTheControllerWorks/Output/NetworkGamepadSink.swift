@@ -154,8 +154,11 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
                 p.wantAxes = [0, 0, 0, 0]
                 p.announced = false
             } else if now - p.lastRefreshAt >= Self.refreshInterval {
+                // Force a resend of HELD buttons/axes only. A button released
+                // since the last tick still has its sent-bit set; clearing
+                // that too would swallow the pending release.
                 p.lastRefreshAt = now
-                p.sentButtons &= p.wantButtons
+                p.sentButtons &= ~p.wantButtons
                 for i in 0..<4 where p.wantAxes[i] != 0 { p.sentAxes[i] = 0 }
             }
 
