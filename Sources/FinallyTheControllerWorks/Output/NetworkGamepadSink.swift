@@ -67,6 +67,7 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
     private let players = (0..<BridgeEngine.maxPlayers).map { _ in Player() }
     private var fd: Int32 = -1
     private var timer: DispatchSourceTimer?
+    private var lastSendErrorAt: TimeInterval = 0
 
     init() {
         queue.async { [weak self] in self?.openSocket() }
@@ -161,22 +162,27 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
             busy = busy || p.hasPending || p.isHeld
             guard now >= p.nextSendAt, p.hasPending else { continue }
 
+            // Only record a message as delivered once sendto accepts it; a
+            // transient failure (ENOBUFS etc.) would otherwise drop a button
+            // release for good, since only diffs are ever sent.
             let port = UInt16(clamping: basePort + slot)
             let diff = p.wantButtons ^ p.sentButtons
             if diff != 0 {
                 let id = diff.trailingZeroBitCount
                 let pressed = (p.wantButtons >> id) & 1
-                send(Self.message(slot: slot, device: Self.retroDeviceJoypad,
-                                  index: 0, id: Int32(id), state: pressed), port: port)
+                guard send(Self.message(slot: slot, device: Self.retroDeviceJoypad,
+                                        index: 0, id: Int32(id), state: pressed),
+                           port: port, now: now) else { continue }
                 p.sentButtons ^= 1 << id
             } else {
                 let axis = (0..<4).max { a, b in
                     abs(Int(p.wantAxes[a]) - Int(p.sentAxes[a]))
                         < abs(Int(p.wantAxes[b]) - Int(p.sentAxes[b]))
                 }!
-                send(Self.message(slot: slot, device: Self.retroDeviceAnalog,
-                                  index: Int32(axis / 2), id: Int32(axis % 2),
-                                  state: UInt16(bitPattern: p.wantAxes[axis])), port: port)
+                guard send(Self.message(slot: slot, device: Self.retroDeviceAnalog,
+                                        index: Int32(axis / 2), id: Int32(axis % 2),
+                                        state: UInt16(bitPattern: p.wantAxes[axis])),
+                           port: port, now: now) else { continue }
                 p.sentAxes[axis] = p.wantAxes[axis]
             }
             p.nextSendAt = now + Self.sendInterval
@@ -205,12 +211,14 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
         return d
     }
 
-    private func send(_ bytes: [UInt8], port: UInt16) {
+    /// True once the kernel accepted the datagram. Failures are logged at
+    /// most once a second; the caller retries on the next tick.
+    private func send(_ bytes: [UInt8], port: UInt16, now: TimeInterval) -> Bool {
         var dest = sockaddr_in()
         dest.sin_family = sa_family_t(AF_INET)
         dest.sin_port = port.bigEndian
         dest.sin_addr.s_addr = UInt32(0x7F000001).bigEndian  // 127.0.0.1
-        _ = bytes.withUnsafeBytes { buf in
+        let sent = bytes.withUnsafeBytes { buf in
             withUnsafePointer(to: &dest) {
                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { destPtr in
                     sendto(fd, buf.baseAddress, buf.count, 0,
@@ -218,6 +226,13 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
                 }
             }
         }
+        if sent == bytes.count { return true }
+        if now - lastSendErrorAt >= 1.0 {
+            lastSendErrorAt = now
+            bridgeLog(.warning, "netpad",
+                      "sendto 127.0.0.1:\(port) failed, retrying: \(String(cString: strerror(errno)))")
+        }
+        return false
     }
 }
 
