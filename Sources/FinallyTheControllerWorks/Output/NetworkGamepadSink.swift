@@ -53,10 +53,21 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
         var sentAxes = [Int16](repeating: 0, count: 4)
         var nextSendAt: TimeInterval = 0
         var lastRefreshAt: TimeInterval = 0
+        /// Held state still to re-assert after the last refresh. Kept apart
+        /// from sent*, which must stay the true model of what the receiver
+        /// holds — clearing sent-bits to force a resend is how a release got
+        /// skipped and a direction stayed stuck.
+        var refreshButtons: UInt16 = 0
+        var refreshAxes = [Bool](repeating: false, count: 4)
         var announced = false
 
+        var reassertButtons: UInt16 { refreshButtons & wantButtons }
+        var reassertAxis: Int? {
+            (0..<4).first { refreshAxes[$0] && wantAxes[$0] != 0 }
+        }
         var hasPending: Bool {
             wantButtons != sentButtons || wantAxes != sentAxes
+                || reassertButtons != 0 || reassertAxis != nil
         }
         var isHeld: Bool {
             wantButtons != 0 || wantAxes.contains { $0 != 0 }
@@ -154,22 +165,24 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
                 p.wantAxes = [0, 0, 0, 0]
                 p.announced = false
             } else if now - p.lastRefreshAt >= Self.refreshInterval {
-                // Force a resend of HELD buttons/axes only. A button released
-                // since the last tick still has its sent-bit set; clearing
-                // that too would swallow the pending release.
                 p.lastRefreshAt = now
-                p.sentButtons &= ~p.wantButtons
-                for i in 0..<4 where p.wantAxes[i] != 0 { p.sentAxes[i] = 0 }
+                p.refreshButtons = p.wantButtons
+                p.refreshAxes = p.wantAxes.map { $0 != 0 }
             }
 
             busy = busy || p.hasPending || p.isHeld
             guard now >= p.nextSendAt, p.hasPending else { continue }
 
-            // Only record a message as delivered once sendto accepts it; a
+            // Priority: button edges, analog changes, then re-asserts. Only
+            // record a message as delivered once sendto accepts it; a
             // transient failure (ENOBUFS etc.) would otherwise drop a button
             // release for good, since only diffs are ever sent.
             let port = UInt16(clamping: basePort + slot)
             let diff = p.wantButtons ^ p.sentButtons
+            let axis = (0..<4).max { a, b in
+                abs(Int(p.wantAxes[a]) - Int(p.sentAxes[a]))
+                    < abs(Int(p.wantAxes[b]) - Int(p.sentAxes[b]))
+            }!
             if diff != 0 {
                 let id = diff.trailingZeroBitCount
                 let pressed = (p.wantButtons >> id) & 1
@@ -177,16 +190,28 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
                                         index: 0, id: Int32(id), state: pressed),
                            port: port, now: now) else { continue }
                 p.sentButtons ^= 1 << id
-            } else {
-                let axis = (0..<4).max { a, b in
-                    abs(Int(p.wantAxes[a]) - Int(p.sentAxes[a]))
-                        < abs(Int(p.wantAxes[b]) - Int(p.sentAxes[b]))
-                }!
+                p.refreshButtons &= ~(UInt16(1) << id)   // an edge supersedes it
+            } else if p.wantAxes[axis] != p.sentAxes[axis] {
                 guard send(Self.message(slot: slot, device: Self.retroDeviceAnalog,
                                         index: Int32(axis / 2), id: Int32(axis % 2),
                                         state: UInt16(bitPattern: p.wantAxes[axis])),
                            port: port, now: now) else { continue }
                 p.sentAxes[axis] = p.wantAxes[axis]
+                p.refreshAxes[axis] = false
+            } else if p.reassertButtons != 0 {
+                let id = p.reassertButtons.trailingZeroBitCount
+                guard send(Self.message(slot: slot, device: Self.retroDeviceJoypad,
+                                        index: 0, id: Int32(id), state: 1),
+                           port: port, now: now) else { continue }
+                p.refreshButtons &= ~(UInt16(1) << id)
+            } else if let held = p.reassertAxis {
+                guard send(Self.message(slot: slot, device: Self.retroDeviceAnalog,
+                                        index: Int32(held / 2), id: Int32(held % 2),
+                                        state: UInt16(bitPattern: p.wantAxes[held])),
+                           port: port, now: now) else { continue }
+                p.refreshAxes[held] = false
+            } else {
+                continue
             }
             p.nextSendAt = now + Self.sendInterval
             if !p.announced {
