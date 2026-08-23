@@ -78,6 +78,13 @@ button remapper for those). RetroArch listens on all interfaces with no
 authentication, so only enable its network gamepad on a network you
 trust.
 
+Looking ahead: RetroArch gained an SDL3 joypad driver upstream in
+mid-2026, but the official macOS builds aren't compiled with it yet. If
+that changes, the SDL bridge above will work with RetroArch too — with
+rumble — by launching it with the patched `libSDL3` like any other SDL3
+app, and the network gamepad becomes the fallback rather than the only
+route.
+
 ## Features
 
 **Working now, in the beta UI**
